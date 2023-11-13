@@ -4,26 +4,20 @@ const cluster = require('cluster');
 const os = require('os');
 const base64 = require('base-64');
 const fetch = require('node-fetch');
-const mongoose = require('mongoose'); // Import Mongoose
-const Cache = require('./cache'); // Import the Mongoose model
+const mongoose = require('mongoose'); 
+const Cache = require('./cache'); 
 
 const API_ENDPOINT = "https://api.ethscriptions.com/";
 const app = express();
 app.use(cors());
 
-// Define the MongoDB connection URL
-const dbUrl = 'mongodb://localhost:27017/apiviamaris3'; // Replace with your actual MongoDB URL
-
-// Connect to the MongoDB database
+const dbUrl = 'mongodb://localhost:27017/apiviamaris8'; 
 mongoose.connect(dbUrl, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
 });
-
-// Get the default connection
 const db = mongoose.connection;
 
-// Handle MongoDB connection events
 db.on('error', console.error.bind(console, 'MongoDB connection error:'));
 db.once('open', () => {
   console.log('Connected to MongoDB');
@@ -89,12 +83,38 @@ async function replacePlaceholders(content) {
   return content;
 }
 
+async function processSvgContentUri(svgBase64Content) {
+  let decodedSvg = base64.decode(svgBase64Content);
+  decodedSvg = await replacePlaceholders(decodedSvg);
+  return base64.encode(decodedSvg);
+}
+
+async function processNestedContentUri(obj) {
+  if (obj !== null && typeof obj === 'object') {
+    for (const key in obj) {
+      if (obj.hasOwnProperty(key)) {
+        const value = obj[key];
+        if (key === 'content_uri' && typeof value === 'string' && (value.includes("data:application/vnd.esc.recursion") || value.includes("data:image/svg+xml"))) {
+          if (value.includes("data:image/svg+xml")) {
+            const base64Content = value.split('base64,')[1];
+            const processedSvgContent = await processSvgContentUri(base64Content);
+            obj[key] = `data:image/svg+xml;base64,${processedSvgContent}`;
+          } else {
+            await processContentUri(obj); 
+          }
+        } else if (typeof value === 'object') {
+          await processNestedContentUri(value); 
+        }
+      }
+    }
+  }
+}
+
 app.get('/*', async (req, res) => {
   console.log(`Received request for URL: ${req.url}`);
   const apiUrl = API_ENDPOINT + req.url;
 
   try {
-    // Check if the request URL is already cached in the database
     const cachedResponse = await Cache.findOne({ requestUrl: apiUrl });
 
     if (cachedResponse) {
@@ -109,32 +129,33 @@ app.get('/*', async (req, res) => {
     }
 
     const contentType = response.headers.get('Content-Type');
-    if (contentType && contentType.startsWith('image')) {
-      // Stream the image directly to the client
+    if (contentType && contentType.startsWith('image/svg+xml')) {
+      let responseData = await response.text(); 
+      const originalResponseData = responseData; 
+
+      responseData = await replacePlaceholders(responseData);
+      const shouldCacheResponse = responseData !== originalResponseData; 
+
       res.setHeader('Content-Type', contentType);
-      response.body.pipe(res);
-    } else {
-      // Handle as JSON for non-image responses
-      const originalResponse = await response.json();
-      let shouldCacheResponse = false; // Flag to determine if the response should be cached
+      res.send(responseData);
 
-      if (originalResponse.ethscriptions && originalResponse.ethscriptions.length > 0) {
-        for (const ethscription of originalResponse.ethscriptions) {
-          if (ethscription.content_uri && ethscription.content_uri.includes("data:application/vnd.esc.recursion")) {
-            await processContentUri(ethscription);
-            shouldCacheResponse = true; // Set flag to cache this response
-          }
-        }
-      } else if (originalResponse.content_uri && originalResponse.content_uri.includes("data:application/vnd.esc.recursion")) {
-        await processContentUri(originalResponse);
-        shouldCacheResponse = true; // Set flag to cache this response
+      if (shouldCacheResponse) {
+        const newCacheEntry = new Cache({
+          requestUrl: apiUrl,
+          responseData: responseData,
+        });
+        await newCacheEntry.save();
       }
+    } else {
+      const originalResponse = await response.json();
+      const copyOfOriginalResponse = JSON.parse(JSON.stringify(originalResponse)); 
 
-      // Add original_content_uri with the actual content_uri data
+      await processNestedContentUri(originalResponse);
+      const shouldCacheResponse = JSON.stringify(originalResponse) !== JSON.stringify(copyOfOriginalResponse); 
+
       addOriginalContentUri(originalResponse, originalResponse.content_uri);
       res.json(originalResponse);
 
-      // Cache the response if recursion match is found
       if (shouldCacheResponse) {
         const newCacheEntry = new Cache({
           requestUrl: apiUrl,
@@ -150,7 +171,6 @@ app.get('/*', async (req, res) => {
 });
 
 function addOriginalContentUri(responseData, originalContentUri) {
-  // Add the original_content_uri key to the response with the actual content_uri value
   responseData.original_content_uri = originalContentUri;
 }
 
